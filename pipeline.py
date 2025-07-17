@@ -43,14 +43,35 @@ class SongGenerationPipeline:
         ]
 
     @classmethod
-    def from_pretrained(cls, ckpt_dir: str):
-        
+    def from_pretrained(cls, ckpt_dir: str, **overrides):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cfg_path = os.path.join(ckpt_dir, "config.yaml")
         ckpt_path = os.path.join(ckpt_dir, "model.pt")
         cfg = OmegaConf.load(cfg_path)
         cfg.mode = "inference"
-
+    
+        override_info = {
+            'max_dur':          ('max_dur', int),
+            'min_dur':          ('min_dur', int),
+            'prompt_len':       ('prompt_len', int),
+            'qwtokenizer_max_len':   ('conditioners.description.QwTokenizer.max_len', int),
+            'qwtexttokenizer_max_len': ('conditioners.type_info.QwTextTokenizer.max_len', int),
+        }
+    
+        for key, value in overrides.items():
+            if key in override_info:
+                config_path, wanted_type = override_info[key]
+                # tip check
+                if not isinstance(value, wanted_type):
+                    raise TypeError(f"Override '{key}' must be of type {wanted_type.__name__}, got {type(value).__name__}.")
+                path_parts = config_path.split(".")
+                c = cfg
+                for p in path_parts[:-1]:
+                    c = getattr(c, p)
+                setattr(c, path_parts[-1], value)
+            else:
+                raise ValueError(f"Unknown override '{key}'. Allowed: {list(override_info)}")
+    
         model_light = CodecLM_PL(cfg, ckpt_path)
         model_light = model_light.eval().to(device)
         model_light.audiolm.cfg = cfg
@@ -61,14 +82,11 @@ class SongGenerationPipeline:
             max_duration=cfg.max_dur,
             seperate_tokenizer=model_light.seperate_tokenizer,
         )
-
         dm_model_path = "third_party/demucs/ckpt/htdemucs.pth"
         dm_config_path = "third_party/demucs/ckpt/htdemucs.yaml"
         separator = get_model_from_yaml(dm_config_path, dm_model_path)
         separator = separator.to(device).eval()
-
         auto_prompt = torch.load("ckpt/prompt.pt")
-
         sample_rate = cfg.get("sample_rate", 48000)
         return cls(
             model=model,
