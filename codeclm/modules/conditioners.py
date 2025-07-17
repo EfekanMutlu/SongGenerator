@@ -334,10 +334,10 @@ class QuantizedEmbeddingConditioner(AudioConditioner):
         B = wav.shape[0]
         wav = wav.reshape(B, self.code_depth, -1).long()
         try:
-            print("in the try:", self.max_len)
+            #print("in the try:", self.max_len)
             new_max_len = resolve_eval_string(self.max_len) + 1
         except:
-            print("in the except:", self.max_len)
+            #print("in the except:", self.max_len)
             new_max_len = self.max_len
         self.max_len = new_max_len
         if wav.shape[2] < self.max_len - 1:
