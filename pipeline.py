@@ -20,82 +20,92 @@ from omegaconf import OmegaConf
 from third_party.demucs.models.pretrained import get_model_from_yaml
 from codeclm.models import CodecLM
 from codeclm.trainer.codec_song_pl import CodecLM_PL
+from pipeline_registry import PipelineRegistry
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
-class SongGenerationPipeline:
+class SongGenerationPipeline(PipelineRegistry):
     def __init__(
         self,
-        model,
-        separator,
-        auto_prompt,
-        cfg,
-        sample_rate: int,
+        model=None,
+        separator=None,
+        auto_prompt=None,
+        cfg=None,
+        sample_rate: int = 48000,
         device: Optional[torch.device] = None,
     ):
-        self.model = model
-        self.separator = separator
-        self.auto_prompt = auto_prompt
+        super().__init__() 
+
+        self.model = None
+        self.separator = None
+        self.auto_prompt = None
         self.cfg = cfg
         self.sample_rate = sample_rate
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.merge_prompt = [
-            item for sublist in self.auto_prompt.values() for item in sublist
-        ]
+        self.merge_prompt = None
 
     @classmethod
-    def from_pretrained(cls, ckpt_dir: str, **overrides):
+    def from_pretrained(cls, ckpt_dir: str, use_accelerate: bool = True, **overrides):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cfg_path = os.path.join(ckpt_dir, "config.yaml")
-        ckpt_path = os.path.join(ckpt_dir, "model.pt")
-        cfg = OmegaConf.load(cfg_path)
+
+
+        cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
         cfg.mode = "inference"
-    
         override_info = {
-            'max_dur':          ('max_dur', int),
-            'min_dur':          ('min_dur', int),
-            'prompt_len':       ('prompt_len', int),
-            'qwtokenizer_max_len':   ('conditioners.description.QwTokenizer.max_len', int),
+            'max_dur': ('max_dur', int),
+            'min_dur': ('min_dur', int),
+            'prompt_len': ('prompt_len', int),
+            'qwtokenizer_max_len': ('conditioners.description.QwTokenizer.max_len', int),
             'qwtexttokenizer_max_len': ('conditioners.type_info.QwTextTokenizer.max_len', int),
         }
-    
         for key, value in overrides.items():
             if key in override_info:
-                config_path, wanted_type = override_info[key]
-                # tip check
-                if not isinstance(value, wanted_type):
-                    raise TypeError(f"Override '{key}' must be of type {wanted_type.__name__}, got {type(value).__name__}.")
-                path_parts = config_path.split(".")
-                c = cfg
-                for p in path_parts[:-1]:
-                    c = getattr(c, p)
-                setattr(c, path_parts[-1], value)
+                config_path, typ = override_info[key]
+                if not isinstance(value, typ):
+                    raise TypeError(f"Override '{key}' must be {typ.__name__}")
+                sub = cfg
+                for p in config_path.split('.')[:-1]:
+                    sub = getattr(sub, p)
+                setattr(sub, config_path.split('.')[-1], value)
             else:
-                raise ValueError(f"Unknown override '{key}'. Allowed: {list(override_info)}")
-    
-        model_light = CodecLM_PL(cfg, ckpt_path)
-        model_light = model_light.eval().to(device)
-        model_light.audiolm.cfg = cfg
-        model = CodecLM(
-            name="tmp",
-            lm=model_light.audiolm,
-            audiotokenizer=model_light.audio_tokenizer,
-            max_duration=cfg.max_dur,
-            seperate_tokenizer=model_light.seperate_tokenizer,
-        )
-        dm_model_path = "third_party/demucs/ckpt/htdemucs.pth"
-        dm_config_path = "third_party/demucs/ckpt/htdemucs.yaml"
-        separator = get_model_from_yaml(dm_config_path, dm_model_path)
+                raise ValueError(f"Unknown override '{key}'")
+            
+        if use_accelerate:
+            with init_empty_weights():
+                lite = CodecLM_PL(cfg, os.path.join(ckpt_dir, "model.pt"))
+            model = load_checkpoint_and_dispatch(
+                lite.audiolm, ckpt_dir, device_map="auto", offload_folder=ckpt_dir + "/offload"
+            )
+
+            model = CodecLM(
+                name="from_accel",
+                lm=model,
+                audiotokenizer=lite.audio_tokenizer,
+                max_duration=cfg.max_dur,
+                seperate_tokenizer=lite.seperate_tokenizer,
+            )
+        else:
+            lite = CodecLM_PL(cfg, os.path.join(ckpt_dir, "model.pt"))
+            lite = lite.eval().to(device)
+            model = CodecLM(
+                name="tmp",
+                lm=lite.audiolm,
+                audiotokenizer=lite.audio_tokenizer,
+                max_duration=cfg.max_dur,
+                seperate_tokenizer=lite.seperate_tokenizer,
+            )
+
+        dm_cfg = os.path.join(ckpt_dir, "separator.yaml")
+        dm_ckpt = os.path.join(ckpt_dir, "separator_model.pth")
+        separator = get_model_from_yaml(dm_cfg, dm_ckpt)
         separator = separator.to(device).eval()
-        auto_prompt = torch.load("ckpt/prompt.pt")
+
+        auto_prompt = torch.load(os.path.join(ckpt_dir, "prompt.pt"), map_location="cpu")
         sample_rate = cfg.get("sample_rate", 48000)
-        return cls(
-            model=model,
-            separator=separator,
-            auto_prompt=auto_prompt,
-            cfg=cfg,
-            sample_rate=sample_rate,
-            device=device,
-        )
+
+        pipe = cls(cfg=cfg, sample_rate=sample_rate, device=device)
+        pipe.register_modules(model=model, separator=separator, auto_prompt=auto_prompt)
+        pipe.merge_prompt = [item for v in auto_prompt.values() for item in v]
+        return pipe
 
     def _load_audio(self, f):
         a, fs = torchaudio.load(f)
@@ -144,10 +154,7 @@ class SongGenerationPipeline:
         return_tokens: bool = False,
         output_type: Literal["wav", "tensor"] = "wav",
     ):
-        """
-        Diffusers-style flexible inference function.
-        Takes individual params, or can be dict-unpacked with JSONL row.
-        """
+
         # Prompt input priority: prompt_audio_path > auto_prompt_audio_type > direct wavs > None
         if prompt_audio_path and auto_prompt_audio_type:
             raise ValueError("Only one of prompt_audio_path or auto_prompt_audio_type can be used.")
@@ -161,7 +168,7 @@ class SongGenerationPipeline:
             if auto_prompt_audio_type == "Auto":
                 prompt_token = self.merge_prompt[
                     np.random.randint(0, len(self.merge_prompt))
-                ]
+                ] #TODO
             else:
                 prompt_token = self.auto_prompt[auto_prompt_audio_type][
                     np.random.randint(0, len(self.auto_prompt[auto_prompt_audio_type]))
@@ -190,14 +197,14 @@ class SongGenerationPipeline:
             "melody_is_wav": melody_is_wav,
         }
         with torch.autocast(device_type="cuda", dtype=torch.float16):
-            tokens = self.model.generate(**generate_inp, return_tokens=True)
+            tokens = self.model.generate(**generate_inp, return_tokens=True) #TODO
 
         if melody_is_wav:
-            wav_seperate = self.model.generate_audio(
+            wav_seperate = self.model.generate_audio( #TODO
                 tokens, pmt_wav, vocal_wav, bgm_wav
             )
         else:
-            wav_seperate = self.model.generate_audio(tokens)
+            wav_seperate = self.model.generate_audio(tokens) #TODO
        
         if output_type == "wav":
             return wav_seperate[0].cpu().float()
