@@ -22,10 +22,10 @@ from third_party.demucs.models.pretrained import get_model_from_yaml
 from codeclm.models import CodecLM
 from codeclm.trainer.codec_song_pl import CodecLM_PL
 from pipeline_registry import PipelineRegistry
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+#from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 class SongGenerationPipeline(PipelineRegistry):
-    _ram_cache = {}
+    _ram_cache: dict = {}
     def __init__(
         self,
         model=None,
@@ -47,10 +47,7 @@ class SongGenerationPipeline(PipelineRegistry):
 
     @classmethod
     def from_pretrained(cls, ckpt_dir: str, **overrides):
-        import os
-        import json
-        import torch
-    
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cache_dir = os.path.expanduser("~/.cache/SongGenerator")
         os.makedirs(cache_dir, exist_ok=True)
@@ -62,16 +59,15 @@ class SongGenerationPipeline(PipelineRegistry):
         prompt_pt = os.path.join(cache_dir, f"{cache_key}_prompt.pt")
         meta_json = os.path.join(cache_dir, f"{cache_key}_meta.json")
     
-        # --- 1) RAM CACHE KONTROLÜ ---
+        # --- 1) RAM CACHE CONTROL ---
         if cache_key in cls._ram_cache:
-            print("RAM cache'ten alındı.")
+            print("RAM loading from cache...")
             return cls._ram_cache[cache_key]
     
-        # --- 2) build() TANIMI ---
+        # --- 2) build() DEFINE ---
         def build():
             cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
             cfg.mode = "inference"
-            # override işlemi (istersen override_info ile ek kontrol ekle)
             for key, value in overrides.items():
                 if hasattr(cfg, key):
                     setattr(cfg, key, value)
@@ -97,12 +93,11 @@ class SongGenerationPipeline(PipelineRegistry):
             pipe.merge_prompt = [item for v in prompts.values() for item in v]
             return pipe
     
-        # --- 3) DISK CACHE KONTROLÜ ---
+        # --- 3) DISK CACHE CONTROL ---
         if all(os.path.exists(f) for f in [model_pt, separator_pt, prompt_pt, meta_json]):
-            print("Disk cache'ten yükleniyor.")
+            print("Disk loading from cache...")
             meta = json.load(open(meta_json))
-            # (override değiştiyse dikkat et!)
-            pipe = build()  # config ve registry aynen inşa edilir
+            pipe = build()
             pipe.model.load_state_dict(torch.load(model_pt, map_location=device))
             pipe.separator.load_state_dict(torch.load(separator_pt, map_location=device))
             pipe.auto_prompt = torch.load(prompt_pt, map_location="cpu")
@@ -110,8 +105,8 @@ class SongGenerationPipeline(PipelineRegistry):
             cls._ram_cache[cache_key] = pipe
             return pipe
     
-        # --- 4) HİÇBİR CACHE YOKSA TAM YENİDEN OLUŞTUR ---
-        print("Tam kurulum ve disk cache'e yazma...")
+        # --- 4) IF NO CACHE ---
+        print("Building new pipeline...")
         pipe = build()
         torch.save(pipe.model.state_dict(), model_pt)
         torch.save(pipe.separator.state_dict(), separator_pt)
@@ -177,13 +172,19 @@ class SongGenerationPipeline(PipelineRegistry):
             pmt_wav, vocal_wav, bgm_wav = self._separate_audio(prompt_audio_path)
             melody_is_wav = True
         elif auto_prompt_audio_type:
-            if auto_prompt_audio_type != "Auto" and auto_prompt_audio_type not in self.auto_prompt:
-                raise ValueError(f"{auto_prompt_audio_type} geçerli değil, auto_prompt içinde yok")
+            if (
+                self.auto_prompt is not None
+                and auto_prompt_audio_type != "Auto"
+                and auto_prompt_audio_type not in self.auto_prompt
+            ):
+                raise ValueError(f"{auto_prompt_audio_type} is not a valid key in auto_prompt. Available keys: {list(self.auto_prompt.keys())}")
             if auto_prompt_audio_type == "Auto":
+                assert self.merge_prompt is not None
                 prompt_token = self.merge_prompt[
                     np.random.randint(0, len(self.merge_prompt))
                 ] #TODO
             else:
+                assert self.auto_prompt is not None
                 prompt_token = self.auto_prompt[auto_prompt_audio_type][
                     np.random.randint(0, len(self.auto_prompt[auto_prompt_audio_type]))
                 ]
@@ -211,13 +212,16 @@ class SongGenerationPipeline(PipelineRegistry):
             "melody_is_wav": melody_is_wav,
         }
         with torch.autocast(device_type="cuda", dtype=torch.float16):
+            assert self.model is not None, "model is not registered or register_modules is not called."
             tokens = self.model.generate(**generate_inp, return_tokens=True) #TODO
 
         if melody_is_wav:
+            assert self.model is not None, "model is not registered or register_modules is not called."
             wav_seperate = self.model.generate_audio( #TODO
                 tokens, pmt_wav, vocal_wav, bgm_wav
             )
         else:
+            assert self.model is not None, "model is not registered or register_modules is not called."
             wav_seperate = self.model.generate_audio(tokens) #TODO
        
         if output_type == "wav":
@@ -225,7 +229,7 @@ class SongGenerationPipeline(PipelineRegistry):
         elif output_type == "tensor":
             return (wav_seperate[0].cpu().float(), tokens) if return_tokens else wav_seperate[0].cpu().float()
         else:
-            raise ValueError(f"output_type {output_type} desteklenmiyor.")
+            raise ValueError(f"output_type {output_type} is not supported. Use 'wav' or 'tensor'.")
 
     def pipe(self, *args, **kwargs):
         return self.__call__(*args, **kwargs)
