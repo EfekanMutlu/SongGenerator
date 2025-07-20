@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.getcwd(), "codeclm/tokenizer/Flow1dVAE/"))
 import json
 import time
 import numpy as np
+import pickle
 import torch
 import torchaudio
 from typing import Optional, Literal
@@ -24,6 +25,7 @@ from pipeline_registry import PipelineRegistry
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 class SongGenerationPipeline(PipelineRegistry):
+    _ram_cache = {}
     def __init__(
         self,
         model=None,
@@ -44,46 +46,35 @@ class SongGenerationPipeline(PipelineRegistry):
         self.merge_prompt = None
 
     @classmethod
-    def from_pretrained(cls, ckpt_dir: str, use_accelerate: bool = True, **overrides):
+    def from_pretrained(cls, ckpt_dir: str, **overrides):
+        import os
+        import json
+        import torch
+    
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-        cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
-        cfg.mode = "inference"
-        override_info = {
-            'max_dur': ('max_dur', int),
-            'min_dur': ('min_dur', int),
-            'prompt_len': ('prompt_len', int),
-            'qwtokenizer_max_len': ('conditioners.description.QwTokenizer.max_len', int),
-            'qwtexttokenizer_max_len': ('conditioners.type_info.QwTextTokenizer.max_len', int),
-        }
-        for key, value in overrides.items():
-            if key in override_info:
-                config_path, typ = override_info[key]
-                if not isinstance(value, typ):
-                    raise TypeError(f"Override '{key}' must be {typ.__name__}")
-                sub = cfg
-                for p in config_path.split('.')[:-1]:
-                    sub = getattr(sub, p)
-                setattr(sub, config_path.split('.')[-1], value)
-            else:
-                raise ValueError(f"Unknown override '{key}'")
-            
-        if use_accelerate:
-            with init_empty_weights():
-                lite = CodecLM_PL(cfg, os.path.join(ckpt_dir, "model.pt"))
-            model = load_checkpoint_and_dispatch(
-                lite.audiolm, ckpt_dir, device_map="auto", offload_folder=ckpt_dir + "/offload"
-            )
-
-            model = CodecLM(
-                name="from_accel",
-                lm=model,
-                audiotokenizer=lite.audio_tokenizer,
-                max_duration=cfg.max_dur,
-                seperate_tokenizer=lite.seperate_tokenizer,
-            )
-        else:
+        cache_dir = os.path.expanduser("~/.cache/SongGenerator")
+        os.makedirs(cache_dir, exist_ok=True)
+        override_key = "_".join(f"{k}={v}" for k, v in sorted(overrides.items()))
+        cache_key = f"{os.path.basename(ckpt_dir)}_{override_key or 'default'}"
+    
+        model_pt = os.path.join(cache_dir, f"{cache_key}_model.pt")
+        separator_pt = os.path.join(cache_dir, f"{cache_key}_separator.pt")
+        prompt_pt = os.path.join(cache_dir, f"{cache_key}_prompt.pt")
+        meta_json = os.path.join(cache_dir, f"{cache_key}_meta.json")
+    
+        # --- 1) RAM CACHE KONTROLÜ ---
+        if cache_key in cls._ram_cache:
+            print("RAM cache'ten alındı.")
+            return cls._ram_cache[cache_key]
+    
+        # --- 2) build() TANIMI ---
+        def build():
+            cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
+            cfg.mode = "inference"
+            # override işlemi (istersen override_info ile ek kontrol ekle)
+            for key, value in overrides.items():
+                if hasattr(cfg, key):
+                    setattr(cfg, key, value)
             lite = CodecLM_PL(cfg, os.path.join(ckpt_dir, "model.pt"))
             lite = lite.eval().to(device)
             model = CodecLM(
@@ -93,18 +84,41 @@ class SongGenerationPipeline(PipelineRegistry):
                 max_duration=cfg.max_dur,
                 seperate_tokenizer=lite.seperate_tokenizer,
             )
-
-        dm_cfg = os.path.join(ckpt_dir, "separator.yaml")
-        dm_ckpt = os.path.join(ckpt_dir, "separator_model.pth")
-        separator = get_model_from_yaml(dm_cfg, dm_ckpt)
-        separator = separator.to(device).eval()
-
-        auto_prompt = torch.load(os.path.join(ckpt_dir, "prompt.pt"), map_location="cpu")
-        sample_rate = cfg.get("sample_rate", 48000)
-
-        pipe = cls(cfg=cfg, sample_rate=sample_rate, device=device)
-        pipe.register_modules(model=model, separator=separator, auto_prompt=auto_prompt)
-        pipe.merge_prompt = [item for v in auto_prompt.values() for item in v]
+    
+            root = os.getcwd()
+            sep = get_model_from_yaml(
+                os.path.join(root, "third_party/demucs/ckpt/htdemucs.yaml"),
+                os.path.join(root, "third_party/demucs/ckpt/htdemucs.pth"))
+            sep = sep.to(device).eval()
+    
+            prompts = torch.load(os.path.join(root, "ckpt/prompt.pt"), map_location="cpu")
+            pipe = cls(cfg=cfg, sample_rate=cfg.get("sample_rate",48000), device=device)
+            pipe.register_modules(model=model, separator=sep, auto_prompt=prompts)
+            pipe.merge_prompt = [item for v in prompts.values() for item in v]
+            return pipe
+    
+        # --- 3) DISK CACHE KONTROLÜ ---
+        if all(os.path.exists(f) for f in [model_pt, separator_pt, prompt_pt, meta_json]):
+            print("Disk cache'ten yükleniyor.")
+            meta = json.load(open(meta_json))
+            # (override değiştiyse dikkat et!)
+            pipe = build()  # config ve registry aynen inşa edilir
+            pipe.model.load_state_dict(torch.load(model_pt, map_location=device))
+            pipe.separator.load_state_dict(torch.load(separator_pt, map_location=device))
+            pipe.auto_prompt = torch.load(prompt_pt, map_location="cpu")
+            pipe.merge_prompt = [item for v in pipe.auto_prompt.values() for item in v]
+            cls._ram_cache[cache_key] = pipe
+            return pipe
+    
+        # --- 4) HİÇBİR CACHE YOKSA TAM YENİDEN OLUŞTUR ---
+        print("Tam kurulum ve disk cache'e yazma...")
+        pipe = build()
+        torch.save(pipe.model.state_dict(), model_pt)
+        torch.save(pipe.separator.state_dict(), separator_pt)
+        torch.save(pipe.auto_prompt, prompt_pt)
+        with open(meta_json, "w") as f:
+            json.dump({"ckpt_dir": ckpt_dir, "overrides": overrides}, f)
+        cls._ram_cache[cache_key] = pipe
         return pipe
 
     def _load_audio(self, f):
