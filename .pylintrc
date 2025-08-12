@@ -1,0 +1,62 @@
+[MASTER]
+# Specify a configuration file.
+ignore-patterns=tests/*
+# A comma-separated list of package or module names from which C extensions may be imported.
+extension-pkg-whitelist=
+# Python code to be analyzed, relative to the current working directory (e.g., `src` or `app`).
+init-hook=
+[MESSAGES CONTROL]
+# Disable some of the more opinionated warnings or ones that don't fit your style guide.
+disable=
+    missing-docstring,
+    import-error,
+    too-few-public-methods,
+    too-many-arguments,
+    too-many-locals,
+    too-many-return-statements,
+    too-many-branches,
+    too-many-statements,
+    line-too-long,
+    invalid-name,
+    duplicate-code,
+    no-else-return,
+    useless-return,
+    unnecessary-pass,
+    no-name-in-module,
+    no-member,
+    unexpected-keyword-arg
+[REPORTS]
+# Set the output format for Pylint. Default is `text`, but `json` or `colorized` is also available.
+output-format=colorized
+# Tells whether to display a full report or only a summary.
+reports=no
+[FORMAT]
+# Maximum number of characters on a single line.
+max-line-length=88
+# Indentation settings.
+indent-string='    '
+indent-after-paren=4
+[LOGGING]
+# Logging modules to check that the string format arguments are in logging function parameters.
+logging-modules=logging
+[DESIGN]
+# Set limits on the number of parameters, locals, and statements.
+max-args=5
+max-locals=15
+max-returns=5
+max-branches=12
+max-statements=50
+[SIMILARITIES]
+# Minimum lines of code to be considered for duplicate code.
+min-similarity-lines=10
+[TYPECHECK]
+# Check for missing members in imported modules.
+ignored-modules=
+[EXCEPTIONS]
+# Exceptions to ignore in the codebase.
+overgeneral-exceptions=Exception
+[MASTER]
+ignore=
+    /app/aura/restyle/easycontrol_img2img/*
+    /app/aura/restyle/inversion_img2img/*
+    /app/aura/baby_img2img/*
