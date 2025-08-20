@@ -82,8 +82,8 @@ class SongGenerationPipeline:
             max_duration=cfg.max_dur,
             seperate_tokenizer=model_light.seperate_tokenizer,
         )
-        dm_model_path = "third_party/demucs/ckpt/htdemucs.pth"
-        dm_config_path = "third_party/demucs/ckpt/htdemucs.yaml"
+        dm_model_path = "ckpt/demucs_ckpt/htdemucs.pth"
+        dm_config_path = "ckpt/demucs_ckpt/htdemucs.yaml"
         separator = get_model_from_yaml(dm_config_path, dm_model_path)
         separator = separator.to(device).eval()
         auto_prompt = torch.load("ckpt/prompt.pt")
